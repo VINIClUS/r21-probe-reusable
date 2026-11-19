@@ -1,0 +1,188 @@
+name: r21-probe-reusable
+
+on:
+  workflow_call:
+    inputs:
+      scenario:
+        description: sub (points 1 and 2) or r21 (point 3)
+        type: string
+        required: true
+
+permissions: {}
+
+env:
+  PROBE_PY: |
+    import base64
+    import hashlib
+    import json
+    import os
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlparse
+
+    AUDIENCE = "sts.amazonaws.com"
+    KEYS = ("sub", "job_workflow_ref", "ref", "environment", "repository",
+            "workflow_ref", "iat", "exp")
+    STATE = os.path.join(os.environ["RUNNER_TEMP"], "probe-first.json")
+    MIN_ELAPSED = 1200
+
+
+    def fail(label, reason):
+        print("PROBE_FAIL label=%s reason=%s" % (label, reason), flush=True)
+        sys.exit(1)
+
+
+    def request(label):
+        url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+        bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+        if not url or not bearer:
+            fail(label, "request_env_missing")
+        host = urlparse(url)
+        if host.scheme != "https" or not (host.hostname or "").endswith(
+                ".actions.githubusercontent.com"):
+            fail(label, "request_host")
+        started = int(time.time())
+        req = urllib.request.Request(
+            url + "&audience=" + AUDIENCE,
+            headers={"Authorization": "Bearer " + bearer})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                status = response.status
+                body = response.read(65536)
+        except urllib.error.HTTPError as exc:
+            fail(label, "http_status=%d" % exc.code)
+        except OSError as exc:
+            fail(label, "transport=%s" % type(exc).__name__)
+        token = json.loads(body)["value"]
+        print("::add-mask::" + token, flush=True)
+        parts = token.split(".")
+        if len(parts) != 3:
+            fail(label, "token_shape")
+        payload = json.loads(base64.urlsafe_b64decode(
+            parts[1] + "=" * (-len(parts[1]) % 4)))
+        record = {
+            "label": label,
+            "status": status,
+            "requested_at": started,
+            "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+            "aud_check": "ok" if payload.get("aud") == AUDIENCE else "mismatch",
+            "claims": {key: payload.get(key) for key in KEYS},
+        }
+        print("PROBE " + json.dumps(record, sort_keys=True), flush=True)
+        return record
+
+
+    def single(label):
+        record = request(label)
+        if record["aud_check"] != "ok":
+            fail(label, "aud_check=mismatch")
+
+
+    def first(label):
+        record = request(label)
+        with open(STATE, "w") as handle:
+            json.dump(record, handle)
+
+
+    def wait(seconds):
+        with open(STATE) as handle:
+            target = json.load(handle)["claims"]["iat"] + int(seconds)
+        while target - time.time() > 0:
+            remaining = target - time.time()
+            print("PROBE_WAIT remaining_s=%d" % remaining, flush=True)
+            time.sleep(min(remaining, 300))
+
+
+    def second(label):
+        with open(STATE) as handle:
+            earlier = json.load(handle)
+        record = request(label)
+        elapsed = record["claims"]["iat"] - earlier["claims"]["iat"]
+        differing = [key for key in KEYS
+                     if earlier["claims"][key] != record["claims"][key]]
+        print("PROBE_R21 first=%s second=%s elapsed_iat_s=%d differing=%s" % (
+            earlier["label"], label, elapsed, ",".join(differing)), flush=True)
+        passed = (elapsed >= MIN_ELAPSED and record["aud_check"] == "ok"
+                  and set(differing) <= {"iat", "exp"})
+        print("PROBE_R21_RESULT second=%s result=%s" % (
+            label, "PASS" if passed else "FAIL"), flush=True)
+        sys.exit(0 if passed else 1)
+
+
+    mode, args = sys.argv[1], sys.argv[2:]
+    if mode == "single":
+        single(args[0])
+    elif mode == "first":
+        first(args[0])
+    elif mode == "wait":
+        wait(args[0])
+    elif mode == "second":
+        second(args[0])
+    elif mode == "same-step":
+        first(args[0])
+        wait(args[2])
+        second(args[1])
+    else:
+        fail(mode, "mode")
+
+jobs:
+  env-sub:
+    if: inputs.scenario == 'sub'
+    runs-on: ubuntu-latest
+    environment: probe-env
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: write-probe
+        run: printf '%s\n' "$PROBE_PY" > "$RUNNER_TEMP/probe.py"
+      - name: token-with-environment
+        run: python3 -I "$RUNNER_TEMP/probe.py" single env-sub
+
+  no-env-sub:
+    if: inputs.scenario == 'sub'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: write-probe
+        run: printf '%s\n' "$PROBE_PY" > "$RUNNER_TEMP/probe.py"
+      - name: token-without-environment
+        run: python3 -I "$RUNNER_TEMP/probe.py" single no-env-sub
+
+  r21-cross-step:
+    if: inputs.scenario == 'r21'
+    runs-on: ubuntu-latest
+    environment: probe-env
+    timeout-minutes: 40
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: write-probe
+        run: printf '%s\n' "$PROBE_PY" > "$RUNNER_TEMP/probe.py"
+      - name: token-first
+        run: python3 -I "$RUNNER_TEMP/probe.py" first xs-a
+      - name: wait
+        run: python3 -I "$RUNNER_TEMP/probe.py" wait 1260
+      - name: token-second
+        run: python3 -I "$RUNNER_TEMP/probe.py" second xs-b
+
+  r21-same-step:
+    if: inputs.scenario == 'r21'
+    runs-on: ubuntu-latest
+    environment: probe-env
+    timeout-minutes: 40
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: write-probe
+        run: printf '%s\n' "$PROBE_PY" > "$RUNNER_TEMP/probe.py"
+      - name: token-first-wait-second
+        run: python3 -I "$RUNNER_TEMP/probe.py" same-step ss-a ss-b 1260
