@@ -1,0 +1,13 @@
+name: dr3-a
+on:
+  workflow_call:
+    inputs:
+      label:
+        type: string
+        required: true
+permissions: {}
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "dr3-a label=${{ inputs.label }}"
